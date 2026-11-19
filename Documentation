@@ -1,0 +1,423 @@
+# Technical Documentation
+
+Detailed reference for the flight data pipeline. For a quick overview, see [README.md](README.md).
+
+## ENVIRONMENT VARIABLES
+
+Copy `.env.example` to `.env` and fill in your own values. Never commit `.env`.
+
+```
+# ---------- POSTGRES (Airflow metadata database) ----------
+POSTGRES_USER=airflow
+POSTGRES_PASSWORD=change_me
+POSTGRES_DB=airflow
+
+# ---------- AIRFLOW ADMIN ----------
+AIRFLOW_ADMIN_USER=admin
+AIRFLOW_ADMIN_FIRSTNAME=Your
+AIRFLOW_ADMIN_LASTNAME=Name
+AIRFLOW_ADMIN_EMAIL=you@example.com
+AIRFLOW_ADMIN_PASSWORD=change_me
+```
+
+Snowflake credentials are **not** stored in `.env`. They live in the Airflow connection `flight_snowflake` (Admin -> Connections). See the README for the fields.
+
+## DATA SOURCE
+
+### API
+
+```
+https://opensky-network.org/api/states/all
+```
+
+Anonymous access, rate-limited. The response has a `time` field (Unix seconds) and a `states` list with one list of 17 values per aircraft.
+
+### API DOCUMENTATION
+
+```
+https://openskynetwork.github.io/opensky-api/rest.html
+```
+
+## AIRFLOW PIPELINE DAG STRUCTURE
+
+| Item | Value |
+|---|---|
+| DAG id | `flights_ops_medallion_pipe` |
+| Schedule | Every 30 minutes (`*/30 * * * *`), `catchup=False` |
+| Task order | `bronze_ingest -> silver_transform -> gold_layer -> snowflake_load` |
+| Orchestrator | Apache Airflow 2.9.3 (Docker Compose, Postgres 15 for metadata) |
+| Airflow connection | `flight_snowflake` (type Snowflake) |
+
+Tasks pass file paths to each other through **XCom** (Airflow's way for tasks to share small values). Only the path travels through XCom. The data stays in files under `/opt/airflow/data`, which maps to `./data` on the host through a Docker volume.
+
+Reference version of `dags/flight_pipeline.py`:
+
+```python
+import sys
+from pathlib import Path
+from datetime import datetime, timedelta
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+AIRFLOW_HOME = Path("/opt/airflow")
+
+if str(AIRFLOW_HOME) not in sys.path:
+    sys.path.insert(0, str(AIRFLOW_HOME))
+
+from scripts.bronze_layer import run_bronze_ingestion
+from scripts.silver_layer import run_silver_transform
+from scripts.gold_layer import run_gold_layer
+from scripts.snowflake_implement import snowflake_load
+
+default_args = {
+    "owner": "airflow",
+    "retries": 0,
+    "retry_delay": timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id="flights_ops_medallion_pipe",
+    default_args=default_args,
+    start_date=datetime(2025, 12, 10),
+    schedule_interval="*/30 * * * *",
+    catchup=False,
+) as dag:
+
+    bronze = PythonOperator(
+        task_id="bronze_ingest",
+        python_callable=run_bronze_ingestion,
+    )
+
+    silver = PythonOperator(
+        task_id="silver_transform",
+        python_callable=run_silver_transform,
+    )
+
+    gold = PythonOperator(
+        task_id="gold_layer",
+        python_callable=run_gold_layer,
+    )
+
+    load = PythonOperator(
+        task_id="snowflake_load",
+        python_callable=snowflake_load,
+    )
+
+    bronze >> silver >> gold >> load
+```
+
+## SQL SCRIPT FOR DATABASE, SCHEMA AND TABLE CREATION
+
+Run once in a Snowsight worksheet with the `ACCOUNTADMIN` role. The same statements are in `sql/01_setup.sql`.
+
+### WAREHOUSE
+
+```sql
+CREATE WAREHOUSE IF NOT EXISTS COMPUTE_WH
+    WAREHOUSE_SIZE = 'XSMALL' AUTO_SUSPEND = 60 AUTO_RESUME = TRUE;
+```
+
+### DATABASE
+
+```sql
+CREATE DATABASE IF NOT EXISTS FLIGHTS;
+```
+
+### SCHEMA
+
+```sql
+CREATE SCHEMA IF NOT EXISTS FLIGHTS.FLIGHTS_SCHEMA;
+```
+
+### GOLD TABLE
+
+```sql
+CREATE TABLE IF NOT EXISTS FLIGHTS.FLIGHTS_SCHEMA.FLIGHT_TABLE (
+    WINDOW_START        TIMESTAMP_NTZ,
+    ORIGIN_COUNTRY      VARCHAR,
+    TOTAL_FLIGHTS       NUMBER(38,0),
+    AVG_AIRBORNE_KMH    FLOAT,
+    ON_GROUND           NUMBER(38,0),
+    LOAD_TIME           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    PCT_ON_GROUND       FLOAT,
+    SHARE_OF_TOTAL_PCT  FLOAT
+);
+```
+
+### SILVER TABLE
+
+```sql
+CREATE TABLE IF NOT EXISTS FLIGHTS.FLIGHTS_SCHEMA.FLIGHTS_SILVER (
+    SNAPSHOT_TIME  TIMESTAMP_NTZ,
+    ICAO24         STRING,
+    CALLSIGN       STRING,
+    AIRLINE_CODE   STRING,
+    ORIGIN_COUNTRY STRING,
+    LONGITUDE      FLOAT,
+    LATITUDE       FLOAT,
+    BARO_ALTITUDE  FLOAT,
+    VELOCITY       FLOAT,
+    VERTICAL_RATE  FLOAT,
+    ON_GROUND      BOOLEAN
+);
+```
+
+### LATEST-SNAPSHOT VIEW
+
+```sql
+CREATE OR REPLACE VIEW FLIGHTS.FLIGHTS_SCHEMA.V_LATEST AS
+SELECT *
+FROM FLIGHTS.FLIGHTS_SCHEMA.FLIGHTS_SILVER
+WHERE SNAPSHOT_TIME = (SELECT MAX(SNAPSHOT_TIME) FROM FLIGHTS.FLIGHTS_SCHEMA.FLIGHTS_SILVER);
+```
+
+## SNOWFLAKE DASHBOARD SCRIPTS
+
+One query per tile (New Tile -> From SQL Worksheet). Pick the chart type **after** running the query. The same queries are in `sql/02_dashboard_queries.sql`.
+
+### 1. Aircraft tracked (Scorecard)
+
+```sql
+SELECT COUNT(*) AS aircraft_tracked
+FROM FLIGHTS.FLIGHTS_SCHEMA.V_LATEST;
+```
+
+### 2. % of aircraft in the air (Scorecard)
+
+```sql
+SELECT ROUND(100 * AVG(IFF(ON_GROUND, 0, 1)), 1) AS pct_in_air
+FROM FLIGHTS.FLIGHTS_SCHEMA.V_LATEST;
+```
+
+### 3. Minutes since last update (Scorecard)
+
+```sql
+SELECT DATEDIFF('minute', MAX(SNAPSHOT_TIME), SYSDATE()) AS minutes_since_update
+FROM FLIGHTS.FLIGHTS_SCHEMA.V_LATEST;
+```
+
+### 4. Which airlines have the most aircraft in the air? (Bar)
+
+```sql
+-- X = AIRLINE, Y = FLIGHTS_IN_AIR, sort by value descending
+SELECT
+    CASE AIRLINE_CODE
+        WHEN 'UAE' THEN 'Emirates'        WHEN 'QTR' THEN 'Qatar Airways'
+        WHEN 'ETD' THEN 'Etihad'          WHEN 'FDB' THEN 'flydubai'
+        WHEN 'ABY' THEN 'Air Arabia'      WHEN 'BAW' THEN 'British Airways'
+        WHEN 'DLH' THEN 'Lufthansa'       WHEN 'AFR' THEN 'Air France'
+        WHEN 'RYR' THEN 'Ryanair'         WHEN 'THY' THEN 'Turkish Airlines'
+        WHEN 'UAL' THEN 'United'          WHEN 'DAL' THEN 'Delta'
+        WHEN 'AAL' THEN 'American'        WHEN 'SWA' THEN 'Southwest'
+        WHEN 'ASA' THEN 'Alaska Airlines' WHEN 'CKK' THEN 'China Cargo'
+        WHEN 'EJA' THEN 'NetJets'         WHEN 'SKW' THEN 'SkyWest'
+        WHEN 'FDX' THEN 'FedEx'           WHEN 'UPS' THEN 'UPS'
+        ELSE AIRLINE_CODE
+    END AS AIRLINE,
+    COUNT(*) AS FLIGHTS_IN_AIR
+FROM FLIGHTS.FLIGHTS_SCHEMA.V_LATEST
+WHERE AIRLINE_CODE IS NOT NULL AND NOT ON_GROUND
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 10;
+```
+
+### 5. Which countries have the most aircraft? (country = registration) (Stacked bar)
+
+```sql
+-- X = ORIGIN_COUNTRY, Y = AIRCRAFT, Group by = STATUS
+WITH top10 AS (
+    SELECT ORIGIN_COUNTRY, TOTAL_FLIGHTS, ON_GROUND
+    FROM FLIGHTS.FLIGHTS_SCHEMA.FLIGHT_TABLE
+    WHERE WINDOW_START = (SELECT MAX(WINDOW_START) FROM FLIGHTS.FLIGHTS_SCHEMA.FLIGHT_TABLE)
+    ORDER BY TOTAL_FLIGHTS DESC
+    LIMIT 10
+)
+SELECT ORIGIN_COUNTRY, 'In the air' AS STATUS, TOTAL_FLIGHTS - ON_GROUND AS AIRCRAFT FROM top10
+UNION ALL
+SELECT ORIGIN_COUNTRY, 'On the ground', ON_GROUND FROM top10;
+```
+
+### 6. What are they doing right now? (Pie)
+
+```sql
+-- Label = PHASE, Value = FLIGHTS
+SELECT CASE WHEN ON_GROUND THEN 'On the ground'
+            WHEN VERTICAL_RATE > 1  THEN 'Climbing'
+            WHEN VERTICAL_RATE < -1 THEN 'Descending'
+            ELSE 'Level flight' END AS PHASE,
+       COUNT(*) AS FLIGHTS
+FROM FLIGHTS.FLIGHTS_SCHEMA.V_LATEST
+GROUP BY 1;
+```
+
+### 7. How does the sky change over time? (UTC) (Line)
+
+```sql
+-- X = SNAPSHOT_TIME, Y = AIRCRAFT, Group by = SERIES
+SELECT SNAPSHOT_TIME, 'All aircraft' AS SERIES, COUNT(*) AS AIRCRAFT
+FROM FLIGHTS.FLIGHTS_SCHEMA.FLIGHTS_SILVER
+GROUP BY 1
+UNION ALL
+SELECT SNAPSHOT_TIME, 'In the air', COUNT_IF(NOT ON_GROUND)
+FROM FLIGHTS.FLIGHTS_SCHEMA.FLIGHTS_SILVER
+GROUP BY 1
+ORDER BY 1;
+```
+
+### 8. Where is the traffic? (20-degree squares) (Heatmap, optional)
+
+```sql
+-- X = LON_BAND, Y = LAT_BAND, Values = FLIGHTS
+SELECT
+    LPAD(FLOOR((LONGITUDE + 180) / 20), 2, '0') || ' (' || (FLOOR((LONGITUDE + 180) / 20) * 20 - 180) || '°)' AS LON_BAND,
+    LPAD(FLOOR((LATITUDE + 90) / 20), 2, '0')   || ' (' || (FLOOR((LATITUDE + 90) / 20) * 20 - 90) || '°)'   AS LAT_BAND,
+    COUNT(*) AS FLIGHTS
+FROM FLIGHTS.FLIGHTS_SCHEMA.V_LATEST
+WHERE LONGITUDE IS NOT NULL AND LATITUDE IS NOT NULL
+GROUP BY 1, 2;
+```
+
+---
+
+# REFERENCE
+
+## LAYERS IN DETAIL
+
+
+### Bronze: `scripts/bronze_layer.py`
+
+- Calls the API with a 30-second timeout and fails the task on any HTTP error status (for example 429 or 500).
+- Saves the raw JSON, unchanged, to `/opt/airflow/data/bronze/flights_<YYYYMMDDHHMMSS>.json` (UTC time of the call). Every run creates a new file.
+- XCom: key `bronze_file`, value = path of the saved file.
+
+### Silver: `scripts/silver_layer.py`
+
+- Reads the bronze path from XCom (`bronze_file` from `bronze_ingest`) and raises an error if it is missing.
+- Loads the `states` list (one list of 17 values per aircraft) into a pandas DataFrame and names the columns.
+- Adds `snapshot_time`: when OpenSky took the snapshot (`time` field in the response, converted from Unix seconds, UTC).
+- Cleans `callsign` (removes padding spaces) and extracts `airline_code`: the first three letters of the callsign when they are followed by a digit (regex `^([A-Z]{3})\d`). Private aircraft and unusual callsigns get an empty value.
+- Keeps 11 columns and saves `/opt/airflow/data/silver/flights_silver_<ts_nodash>.csv`. `ts_nodash` is Airflow's run timestamp without separators (for example `20261117T103000`), so each run gets its own file.
+- XCom: key `silver_file`.
+
+**Silver columns**
+
+| Column | Meaning | Unit |
+|---|---|---|
+| `snapshot_time` | When OpenSky took the snapshot | UTC |
+| `icao24` | Unique aircraft identifier (hex) | |
+| `callsign` | Flight callsign, stripped | |
+| `airline_code` | 3-letter ICAO airline code taken from the callsign | |
+| `origin_country` | Country where the aircraft is **registered** | |
+| `longitude`, `latitude` | Position | degrees |
+| `baro_altitude` | Barometric altitude | metres |
+| `velocity` | Ground speed | metres/second |
+| `vertical_rate` | Climb (+) or descent (−) rate | metres/second |
+| `on_ground` | True if the aircraft is on the ground | boolean |
+
+### Gold: `scripts/gold_layer.py`
+
+Reads the silver CSV and builds one row per `origin_country`:
+
+| Column | Definition |
+|---|---|
+| `total_flights` | Number of aircraft |
+| `on_ground` | Number of aircraft on the ground |
+| `avg_airborne_kmh` | Mean speed of **airborne** aircraft only, converted from m/s to km/h (× 3.6), rounded |
+| `pct_on_ground` | `on_ground / total_flights × 100` |
+| `share_of_total_pct` | Country's share of all aircraft in the snapshot |
+| `snapshot_time` | Snapshot time from silver |
+
+Sorted by `total_flights` descending. The output path is the silver path with `silver` replaced by `gold`. The file is saved **before** the XCom push (`gold_file`), so a path is never shared for a file that failed to save.
+
+### Load: `scripts/snowflake_implement.py`
+
+Uses the `flight_snowflake` connection (login, password, and account/warehouse/role from the connection's Extra field).
+
+1. **Gold → `FLIGHT_TABLE`:** one `MERGE` per country, matched on `(WINDOW_START, ORIGIN_COUNTRY)`. `WINDOW_START` is the DAG run's `data_interval_start`. Re-running the same window updates rows instead of duplicating them. Manual runs get their own window timestamp, so each manual run adds its own rows.
+2. **Silver → `FLIGHTS_SILVER`:** creates the table if missing, deletes any rows with the same `SNAPSHOT_TIME`, then bulk-inserts the snapshot. This makes re-runs safe.
+3. The connection is closed in a `finally` block, even if something fails.
+
+## SNOWFLAKE OBJECTS
+
+
+Created by `sql/01_setup.sql`.
+
+| Object | Type | Purpose |
+|---|---|---|
+| `FLIGHTS.FLIGHTS_SCHEMA.FLIGHTS_SILVER` | Table | One row per aircraft per snapshot (grows over time) |
+| `FLIGHTS.FLIGHTS_SCHEMA.FLIGHT_TABLE` | Table | One row per country per run window |
+| `FLIGHTS.FLIGHTS_SCHEMA.V_LATEST` | View | Only the newest snapshot from `FLIGHTS_SILVER`; most dashboard tiles read from it |
+
+**Storage:** about 11,800 aircraft per snapshot × 48 snapshots a day ≈ 0.5 million silver rows per day. Pause the DAG when you are not using it.
+
+## DASHBOARD NOTES
+
+
+Queries are in `sql/02_dashboard_queries.sql`. Tiles in order:
+
+| # | Tile | Chart | Source |
+|---|---|---|---|
+| 1 | Aircraft tracked | Scorecard | `V_LATEST` |
+| 2 | % of aircraft in the air | Scorecard | `V_LATEST` |
+| 3 | Minutes since last update | Scorecard | `V_LATEST` |
+| 4 | Airlines with the most aircraft in the air | Bar | `V_LATEST` |
+| 5 | Countries with the most aircraft (in the air vs on the ground) | Stacked bar | `FLIGHT_TABLE` |
+| 6 | What are they doing right now (phase) | Pie | `V_LATEST` |
+| 7 | How the sky changes over time | Line | `FLIGHTS_SILVER` |
+| 8 | Where the traffic is (optional) | Heatmap | `V_LATEST` |
+
+**Flight phase rules:** on the ground = `on_ground`; climbing = `vertical_rate > 1` m/s; descending = `vertical_rate < -1` m/s; otherwise level flight.
+
+**Tiles that were tried and dropped:** speed by country (all countries land between about 730 and 860 km/h, so it says little), a "fastest aircraft" table (raw values over 7,000 km/h are sensor errors), and an altitude-band pie (most aircraft cruise, which is expected).
+
+## DESIGN DECISIONS
+
+
+- **Medallion layers:** raw data is kept untouched in bronze, so silver and gold can be rebuilt if the logic changes.
+- **Airborne-only speed:** parked aircraft have a speed near zero, and averaging them in made countries with many parked planes look slow.
+- **`MERGE` for gold, delete-then-insert for silver:** both make re-runs safe without duplicates.
+- **`ts_nodash` in file names:** with a date-only name, every 30-minute run on the same day would overwrite the same file.
+- **`V_LATEST` view:** "latest snapshot" is defined once instead of in every tile.
+- **Gold in SQL for aircraft-level questions:** gold is already summed per country, so airline, altitude and map views read from silver instead.
+
+## OPERATIONS
+
+
+```bash
+docker compose up -d                    # start everything
+docker compose ps                       # check containers are running
+docker compose logs -f airflow-scheduler
+docker compose down                     # stop (data volume is kept)
+```
+
+- To retry one failed step: open the DAG run in the UI, click the task, then **Clear**.
+- To reset the Snowflake tables: `TRUNCATE TABLE FLIGHTS.FLIGHTS_SCHEMA.FLIGHT_TABLE;` and the same for `FLIGHTS_SILVER`.
+- Task logs: Airflow UI → DAG run → task → **Logs**, or `logs/` on the host.
+
+## TROUBLESHOOTING
+
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| DAG shows "Broken DAG: No module named 'airflow.operator'" | Typo in the import | `from airflow.operators.python import PythonOperator` (with an **s**) |
+| "No module named 'bronze_layer'" or "No module named 'scripts'" | Airflow cannot find your scripts folder | Either add `/opt/airflow` to `sys.path` in the DAG and import `from scripts.bronze_layer import ...` (as in the DAG code above), or set `PYTHONPATH: /opt/airflow/scripts` on the webserver and scheduler and import `from bronze_layer import ...` |
+| `unexpected keyword argument 'exists_ok'` | Typo | The argument is `exist_ok` |
+| `xcom_pull() got an unexpected keyword argument 'task_id'` | Typo | The argument is `task_ids` (with an **s**) |
+| `KeyError: 'avg_velocity'` in the load task | The gold column was renamed to `avg_airborne_kmh` | Make the load script use the new name; rename or recreate the Snowflake column |
+| Snowflake error 250001, "Incorrect username or password" | Wrong login name, or the user has no password | Use the **login name** (`SHOW USERS` shows it; it can be an email). If you signed up with Google, set a password: `ALTER USER <name> SET PASSWORD = '...'` |
+| Task fails with HTTP 429 | OpenSky anonymous rate limit | Wait, run less often, or use an OpenSky account |
+| Dashboard tile shows `undefined` / `NaN` | The tile kept the column settings of an earlier query | Delete the tile and create a new one, then pick the chart after running the query |
+| Scorecard shows only one of several columns | A scorecard displays a single value | One query and one tile per number |
+
+## LIMITATIONS AND NEXT STEPS
+
+
+- **"Country" is registration, not location.** Say so wherever country charts appear.
+- **Coverage is uneven.** OpenSky's receivers are volunteer-run and thin over oceans and parts of Asia and Africa.
+- **No retries:** `retries` was set to 0 in `default_args`. Setting it to 2 would absorb temporary API errors.
+- **Gold loads one `MERGE` per country** (about 200 round trips). A batch load would be faster.
+- **Role and login:** the pipeline uses `ACCOUNTADMIN` and a password. A dedicated role limited to the `FLIGHTS` database, and key-pair authentication, would be safer.
+- **Data quality checks** (missing positions, impossible speeds) are not yet automated.
+- **No retention policy** on `FLIGHTS_SILVER`; old snapshots stay until deleted.
