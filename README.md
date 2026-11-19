@@ -89,7 +89,8 @@ Apache Airflow 2.9.3 · Docker Compose · PostgreSQL 15 (Airflow metadata) · Py
 
 ## Dashboard
 
-![Dashboard](docs/dashboard.png)
+<img width="1192" height="630" alt="image" src="https://github.com/user-attachments/assets/2b896853-6294-4404-ae03-e9b7e17bbea7" />
+
 
 Seven tiles that read as a story: how big the sky is (aircraft tracked, % in the air, data freshness) → who flies it (top airlines, top countries) → what they are doing (flight phase) → how it changes over the day (traffic over time).
 
